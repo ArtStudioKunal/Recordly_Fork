@@ -10,7 +10,7 @@ export type SelectedSource = {
 	id?: string;
 	name: string;
 	display_id?: string;
-	sourceType?: "screen" | "window" | "area";
+	sourceType?: "screen" | "window" | "area" | "multi-screen";
 	appName?: string;
 	windowTitle?: string;
 	/** For area sources, the recorded part of the display. */
