@@ -462,6 +462,10 @@ export function registerRecordingHandlers(
 
 					const browserMicFallbackRequested =
 						shouldStartWindowsBrowserMicrophoneFallback(options);
+					const combinedDisplays = source.id === "multi-screen:all" ? getScreen().getAllDisplays() : null;
+					if (combinedDisplays && combinedDisplays.length < 2) {
+						return { success: false, message: "Connect at least two monitors to record all monitors." };
+					}
 					const captureTarget = resolveWindowsCaptureTarget(
 						source,
 						getScreen().getAllDisplays(),
@@ -476,7 +480,9 @@ export function registerRecordingHandlers(
 						fps: 60,
 					};
 
-					if (captureTarget.kind === "invalid-window") {
+					if (combinedDisplays) {
+						config.captureAllMonitors = true;
+					} else if (captureTarget.kind === "invalid-window") {
 						return {
 							success: false,
 							message:
@@ -484,7 +490,9 @@ export function registerRecordingHandlers(
 						};
 					}
 
-					if (captureTarget.kind === "window") {
+					if (combinedDisplays) {
+						// The native helper captures the physical Windows virtual desktop.
+					} else if (captureTarget.kind === "window") {
 						config.windowHandle = captureTarget.windowHandle;
 					} else {
 						// Windows Graphics Capture (WGC) requires a raw HMONITOR handle.
