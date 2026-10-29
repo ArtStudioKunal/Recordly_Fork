@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <vector>
+#include <algorithm>
 
 static std::atomic<bool> g_stopRequested{false};
 static std::atomic<bool> g_pauseRequested{false};
@@ -50,6 +52,7 @@ struct CaptureConfig {
     bool hasDisplayBounds = false;
     bool captureSystemAudio = false;
     bool captureMic = false;
+    bool captureAllMonitors = false;
 };
 
 static bool parseSimpleJson(const std::string& json, CaptureConfig& config) {
@@ -142,6 +145,7 @@ static bool parseSimpleJson(const std::string& json, CaptureConfig& config) {
 
     config.captureSystemAudio = findBool("captureSystemAudio");
     config.captureMic = findBool("captureMic");
+    config.captureAllMonitors = findBool("captureAllMonitors");
 
     int dx = findInt("displayX");
     int dy = findInt("displayY");
@@ -284,6 +288,155 @@ static void stdinListenerThread() {
     g_stopCv.notify_all();
 }
 
+
+/**
+ * Windows virtual-desktop capture path. BitBlt copies the composed desktop
+ * surface (including monitors with negative coordinates) into one BGRA frame.
+ * The existing Media Foundation encoder and WASAPI sidecars are reused.
+ * This backend is deliberately separate from WGC window capture.
+ */
+static int recordVirtualDesktop(const CaptureConfig& config) {
+    const int originX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int originY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int physicalWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int physicalHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (physicalWidth < 2 || physicalHeight < 2) {
+        std::cerr << "ERROR: Invalid virtual desktop dimensions" << std::endl;
+        return 1;
+    }
+    const int width = physicalWidth & ~1;
+    const int height = physicalHeight & ~1;
+    if (width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+        std::cerr << "ERROR: Combined monitor dimensions exceed D3D11 limit" << std::endl;
+        return 1;
+    }
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL level;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        &device, &level, &context);
+    if (FAILED(hr)) {
+        std::cerr << "ERROR: Cannot initialize virtual desktop D3D device" << std::endl;
+        return 1;
+    }
+    D3D11_TEXTURE2D_DESC textureDesc{};
+    textureDesc.Width = width;
+    textureDesc.Height = height;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(device->CreateTexture2D(&textureDesc, nullptr, &texture))) return 1;
+
+    HDC desktopDc = GetDC(nullptr);
+    if (!desktopDc) return 1;
+    HDC memoryDc = CreateCompatibleDC(desktopDc);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(desktopDc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!memoryDc || !bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memoryDc) DeleteDC(memoryDc);
+        ReleaseDC(nullptr, desktopDc);
+        return 1;
+    }
+    HGDIOBJ previous = SelectObject(memoryDc, bitmap);
+    MFEncoder encoder;
+    const std::wstring output = utf8ToWide(config.outputPath);
+    if (!encoder.initialize(output, width, height, config.fps, device.Get(), context.Get())) {
+        SelectObject(memoryDc, previous);
+        DeleteObject(bitmap);
+        DeleteDC(memoryDc);
+        ReleaseDC(nullptr, desktopDc);
+        return 1;
+    }
+
+    WasapiCapture loopback;
+    WasapiCapture mic;
+    bool audioActive = false;
+    bool micActive = false;
+    const bool audioReady = config.captureSystemAudio &&
+        !config.audioOutputPath.empty() && loopback.initializeLoopback(config.audioOutputPath);
+    const bool micReady = config.captureMic && !config.micOutputPath.empty() &&
+        mic.initializeMic(config.micOutputPath, config.micDeviceId, config.micDeviceName);
+    if (config.captureMic && !micReady) reportMicrophoneCaptureUnavailable();
+
+    std::thread(stdinListenerThread).detach();
+    if (audioReady) audioActive = loopback.start();
+    if (micReady) {
+        micActive = mic.start();
+        if (!micActive) reportMicrophoneCaptureUnavailable();
+    }
+    const auto framePeriod = std::chrono::nanoseconds(1000000000LL / (std::max)(1, config.fps));
+    auto nextFrame = std::chrono::steady_clock::now();
+    int64_t firstTimestamp = -1;
+    int64_t capturedFrames = 0;
+    bool failed = false;
+    while (!g_stopRequested) {
+        if (g_pauseRequested) {
+            if (audioActive) loopback.pause();
+            if (micActive) mic.pause();
+        } else {
+            if (audioActive) loopback.resume();
+            if (micActive) mic.resume();
+            if (!BitBlt(memoryDc, 0, 0, width, height, desktopDc, originX, originY,
+                        SRCCOPY | CAPTUREBLT)) {
+                failed = true;
+                break;
+            }
+            context->UpdateSubresource(texture.Get(), 0, nullptr, pixels, width * 4, 0);
+            const int64_t timestamp = queryPerformanceCounterHns();
+            if (firstTimestamp < 0) firstTimestamp = timestamp;
+            if (!encoder.writeFrame(texture.Get(), adjustedVideoTimestampHns(timestamp))) {
+                failed = true;
+                break;
+            }
+            ++capturedFrames;
+            if (capturedFrames == 1) {
+                std::cout << "Recording started" << std::endl;
+                std::cout.flush();
+            }
+        }
+        nextFrame += framePeriod;
+        const auto now = std::chrono::steady_clock::now();
+        if (nextFrame < now) nextFrame = now;
+        std::this_thread::sleep_until(nextFrame);
+    }
+    const int64_t stopTimestamp = adjustedVideoTimestampHns(queryPerformanceCounterHns());
+    if (audioActive) loopback.stop();
+    if (micActive) mic.stop();
+    if (audioActive && firstTimestamp >= 0)
+        writeCompanionAudioTimingMetadata(config.audioOutputPath, firstTimestamp, loopback);
+    if (micActive && firstTimestamp >= 0)
+        writeCompanionAudioTimingMetadata(config.micOutputPath, firstTimestamp, mic);
+    if (capturedFrames > 0) encoder.extendLastFrameTo(stopTimestamp);
+    const bool finalized = encoder.finalize();
+    SelectObject(memoryDc, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(nullptr, desktopDc);
+    if (failed || !finalized || capturedFrames == 0) {
+        DeleteFileW(output.c_str());
+        std::cerr << "ERROR: Virtual desktop capture failed" << std::endl;
+        return 1;
+    }
+    std::cout << "Recording stopped. Output path: " << config.outputPath << std::endl;
+    std::cout.flush();
+    Sleep(100);
+    ExitProcess(0);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "ERROR: Missing JSON config argument" << std::endl;
@@ -301,6 +454,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "ERROR: Failed to parse config JSON" << std::endl;
         return 1;
     }
+
+    if (config.captureAllMonitors) return recordVirtualDesktop(config);
 
     WgcSession session;
 
