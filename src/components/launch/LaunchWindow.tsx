@@ -186,11 +186,17 @@ function LaunchWindowContent() {
 		try {
 			if (!(await cancelRecordingStart())) return;
 			if (!(await preparePermissions())) return;
-			const result = await window.electronAPI.pickCaptureTarget();
-			if (result.success && result.source) syncSelectedSource(result.source);
-			if (result.message && !result.canceled) {
-				if (result.success) toast.info(result.message);
-				else toast.error(result.message);
+			if (platform === "win32") {
+				// The overlay picker only supports a single screen/window.
+				// Use the source list so Windows users can choose all monitors.
+				await window.electronAPI.openSourceSelector();
+			} else {
+				const result = await window.electronAPI.pickCaptureTarget();
+				if (result.success && result.source) syncSelectedSource(result.source);
+				if (result.message && !result.canceled) {
+					if (result.success) toast.info(result.message);
+					else toast.error(result.message);
+				}
 			}
 		} catch {
 			toast.error("Unable to open the source picker.");
@@ -204,6 +210,7 @@ function LaunchWindowContent() {
 		preparePermissions,
 		finalizing,
 		beginInteractiveHudAction,
+		platform,
 		syncSelectedSource,
 	]);
 
