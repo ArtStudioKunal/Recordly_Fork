@@ -19,6 +19,11 @@ export async function validateCaptureSource(candidate: unknown): Promise<Selecte
 	if (!candidate || typeof candidate !== "object") return null;
 	const source = candidate as Partial<SelectedSource>;
 	if (typeof source.id !== "string" || typeof source.name !== "string") return null;
+	if (source.id === "multi-screen:all") {
+		return process.platform === "win32" && getScreen().getAllDisplays().length >= 2
+			? { id: "multi-screen:all", name: "All Monitors", sourceType: "multi-screen" }
+			: null;
+	}
 	if (source.id === LINUX_PORTAL_SCREEN_SOURCE_ID)
 		return process.platform === "linux" && isLikelyLinuxWaylandSession(process.env)
 			? { id: source.id, name: "System picker", sourceType: "screen" }
