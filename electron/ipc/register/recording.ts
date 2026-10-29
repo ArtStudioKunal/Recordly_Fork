@@ -494,7 +494,7 @@ export function registerRecordingHandlers(
 						// The native helper captures the physical Windows virtual desktop.
 					} else if (captureTarget.kind === "window") {
 						config.windowHandle = captureTarget.windowHandle;
-					} else {
+					} else if (captureTarget.kind === "display") {
 						// Windows Graphics Capture (WGC) requires a raw HMONITOR handle.
 						// We attempt to resolve the handle by matching the physical coordinates of the target display.
 						const monitors = getMonitorHandles();
