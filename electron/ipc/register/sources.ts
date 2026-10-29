@@ -268,7 +268,7 @@ export async function getDesktopSources(
 				appIcon: includeWindowIcons && source.appIcon ? source.appIcon.toDataURL() : null,
 				sourceType: "window" as const,
 			}));
-		const result = [...screenSources, ...windowSources];
+		const result = [...(process.platform === "win32" && displays.length >= 2 ? [{ id: "multi-screen:all", name: "All Monitors (Combined)", sourceType: "multi-screen" as const, thumbnail: null, appIcon: null }] : []), ...screenSources, ...windowSources];
 		sourceListCache = {
 			key: cacheKey,
 			expiresAt: Date.now() + SOURCE_LIST_CACHE_TTL_MS,
