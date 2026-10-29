@@ -105,7 +105,7 @@ function LinuxSourceList() {
 						No recording sources found.
 					</p>
 				) : (
-					["screen", "window"].map((kind) => {
+					["multi-screen", "screen", "window"].map((kind) => {
 						const entries = sources.filter((source) =>
 							source.id.startsWith(`${kind}:`),
 						);
@@ -113,7 +113,7 @@ function LinuxSourceList() {
 							entries.length > 0 && (
 								<section key={kind} className="mb-3">
 									<h2 className="px-2 py-2 text-xs font-semibold text-muted">
-										{kind === "screen" ? "Screens" : "Windows"}
+										{kind === "multi-screen" ? "Multiple Monitors" : kind === "screen" ? "Screens" : "Windows"}
 									</h2>
 									<div className="space-y-1">
 										{entries.map((source) => (
@@ -162,5 +162,5 @@ export function SourceSelector() {
 		void window.electronAPI.getPlatform().then(setPlatform);
 	}, []);
 	if (!platform) return null;
-	return platform === "linux" ? <LinuxSourceList /> : <OverlaySourceSelector />;
+	return platform === "linux" || platform === "win32" ? <LinuxSourceList /> : <OverlaySourceSelector />;
 }
